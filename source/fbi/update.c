@@ -3,128 +3,321 @@
 #include <string.h>
 
 #include <3ds.h>
-#include <jansson.h>
 
-#include "resources.h"
 #include "section.h"
-#include "action/action.h"
-#include "task/uitask.h"
-#include "../core/core.h"
+#include "task/task.h"
+#include "../error.h"
+#include "../info.h"
+#include "../prompt.h"
+#include "../ui.h"
+#include "../../core/screen.h"
+#include "../../core/util.h"
+#include "../../json/json.h"
+
+#define URL_MAX 1024
 
 typedef struct {
-    u32 id;
-    bool cia;
-    titledb_cache_entry data;
+    char url[URL_MAX];
+
+    u32 responseCode;
+    data_op_data installInfo;
 } update_data;
 
-static void update_finished_url(void* data, u32 index) {
-    update_data* updateData = (update_data*) data;
-
-    task_populate_titledb_cache_set(updateData->id, updateData->cia, &updateData->data);
+static Result update_is_src_directory(void* data, u32 index, bool* isDirectory) {
+    *isDirectory = false;
+    return 0;
 }
 
-static void update_finished_all(void* data) {
-    free(data);
+static Result update_make_dst_directory(void* data, u32 index) {
+    return 0;
+}
+
+static Result update_open_src(void* data, u32 index, u32* handle) {
+    update_data* updateData = (update_data*) data;
+
+    Result res = 0;
+
+    httpcContext* context = (httpcContext*) calloc(1, sizeof(httpcContext));
+    if(context != NULL) {
+        if(R_SUCCEEDED(res = util_http_open(context, &updateData->responseCode, updateData->url, true))) {
+            *handle = (u32) context;
+        } else {
+            free(context);
+        }
+    } else {
+        res = R_FBI_OUT_OF_MEMORY;
+    }
+
+    return res;
+}
+
+static Result update_close_src(void* data, u32 index, bool succeeded, u32 handle) {
+    return util_http_close((httpcContext*) handle);
+}
+
+static Result update_get_src_size(void* data, u32 handle, u64* size) {
+    u32 downloadSize = 0;
+    Result res = util_http_get_size((httpcContext*) handle, &downloadSize);
+
+    *size = downloadSize;
+    return res;
+}
+
+static Result update_read_src(void* data, u32 handle, u32* bytesRead, void* buffer, u64 offset, u32 size) {
+    return util_http_read((httpcContext*) handle, bytesRead, buffer, size);
+}
+
+static Result update_open_dst(void* data, u32 index, void* initialReadBlock, u64 size, u32* handle) {
+    if(util_get_3dsx_path() != NULL) {
+        FS_Path* path = util_make_path_utf8(util_get_3dsx_path());
+        if(path != NULL) {
+            Result res = FSUSER_OpenFileDirectly(handle, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""), *path, FS_OPEN_WRITE | FS_OPEN_CREATE, 0);
+
+            util_free_path_utf8(path);
+            return res;
+        } else {
+            return R_FBI_OUT_OF_MEMORY;
+        }
+    } else {
+        return AM_StartCiaInstall(MEDIATYPE_SD, handle);
+    }
+
+}
+
+static Result update_close_dst(void* data, u32 index, bool succeeded, u32 handle) {
+    if(util_get_3dsx_path() != NULL) {
+        return FSFILE_Close(handle);
+    } else {
+        if(succeeded) {
+            return AM_FinishCiaInstall(handle);
+        } else {
+            return AM_CancelCIAInstall(handle);
+        }
+    }
+}
+
+static Result update_write_dst(void* data, u32 handle, u32* bytesWritten, void* buffer, u64 offset, u32 size) {
+    return FSFILE_Write(handle, bytesWritten, offset, buffer, size, 0);
+}
+
+static Result update_suspend_copy(void* data, u32 index, u32* srcHandle, u32* dstHandle) {
+    return 0;
+}
+
+static Result update_restore_copy(void* data, u32 index, u32* srcHandle, u32* dstHandle) {
+    return 0;
+}
+
+static Result update_suspend(void* data, u32 index) {
+    return 0;
+}
+
+static Result update_restore(void* data, u32 index) {
+    return 0;
+}
+
+static bool update_error(void* data, u32 index, Result res) {
+    update_data* updateData = (update_data*) data;
+
+    if(res == R_FBI_CANCELLED) {
+        prompt_display("Failure", "Install cancelled.", COLOR_TEXT, false, NULL, NULL, NULL);
+    } else if(res == R_FBI_HTTP_RESPONSE_CODE) {
+        error_display(NULL, NULL, "Failed to update FBI.\nHTTP server returned response code %d", updateData->responseCode);
+    } else {
+        error_display_res(NULL, NULL, res, "Failed to update FBI.");
+    }
+
+    return false;
+}
+
+static void update_install_update(ui_view* view, void* data, float* progress, char* text) {
+    update_data* updateData = (update_data*) data;
+
+    if(updateData->installInfo.finished) {
+        ui_pop();
+        info_destroy(view);
+
+        if(R_SUCCEEDED(updateData->installInfo.result)) {
+            prompt_display("Fatto!", "Aggiornamento completato.", COLOR_TEXT, false, NULL, NULL, NULL);
+        }
+
+        free(updateData);
+
+        return;
+    }
+
+    if(hidKeysDown() & KEY_B) {
+        svcSignalEvent(updateData->installInfo.cancelEvent);
+    }
+
+    *progress = updateData->installInfo.currTotal != 0 ? (float) ((double) updateData->installInfo.currProcessed / (double) updateData->installInfo.currTotal) : 0;
+    snprintf(text, PROGRESS_TEXT_MAX, "%.2f %s / %.2f %s\n%.2f %s/s", util_get_display_size(updateData->installInfo.currProcessed), util_get_display_size_units(updateData->installInfo.currProcessed), util_get_display_size(updateData->installInfo.currTotal), util_get_display_size_units(updateData->installInfo.currTotal), util_get_display_size(updateData->installInfo.copyBytesPerSecond), util_get_display_size_units(updateData->installInfo.copyBytesPerSecond));
 }
 
 static void update_check_update(ui_view* view, void* data, float* progress, char* text) {
     update_data* updateData = (update_data*) data;
 
     bool hasUpdate = false;
-    char updateURL[DOWNLOAD_URL_MAX];
 
     Result res = 0;
+    u32 responseCode = 0;
 
-    json_t* json = NULL;
-    if(R_SUCCEEDED(res = http_download_json("http://api.titledb.ga:7080/v1/entry?nested=true&only=id"
-                                                    "&only=cia.id&only=cia.version&only=cia.updated_at"
-                                                    "&only=tdsx.id&only=tdsx.version&only=tdsx.updated_at"
-                                                    "&_filters=%7B%22name%22%3A%20%22FBI%22%2C%20%22author%22%3A%20%22EMUGames%22%7D", &json, 16 * 1024))) {
-        const char* type = fs_get_3dsx_path() != NULL ? "tdsx" : "cia";
+    httpcContext context;
+    if(R_SUCCEEDED(res = util_http_open(&context, &responseCode, "https://api.github.com/repos/EMUGamesDevTeam/FBI/releases/latest", true))) {
+        u32 size = 0;
+        if(R_SUCCEEDED(res = util_http_get_size(&context, &size))) {
+            char* jsonText = (char*) calloc(sizeof(char), size);
+            if(jsonText != NULL) {
+                u32 bytesRead = 0;
+                if(R_SUCCEEDED(res = util_http_read(&context, &bytesRead, (u8*) jsonText, size))) {
+                    json_value* json = json_parse(jsonText, size);
+                    if(json != NULL) {
+                        if(json->type == json_object) {
+                            json_value* name = NULL;
+                            json_value* assets = NULL;
 
-        json_t* entry = NULL;
-        json_t* idJson = NULL;
-        json_t* objs = NULL;
-        if(json_is_array(json) && json_array_size(json) == 1
-           && json_is_object(entry = json_array_get(json, 0))
-           && json_is_integer(idJson = json_object_get(entry, "id"))
-           && json_is_array(objs = json_object_get(entry, type))) {
-            if(json_array_size(json) > 0) {
-                updateData->id = (u32) json_integer_value(idJson);
-                updateData->cia = fs_get_3dsx_path() != NULL;
-
-                u32 latestMajor = 0;
-                u32 latestMinor = 0;
-                u32 latestMicro = 0;
-
-                for(u32 i = 0; i < json_array_size(objs); i++) {
-                    json_t* obj = json_array_get(objs, i);
-                    if(json_is_object(obj)) {
-                        json_t* subIdJson = json_object_get(obj, "id");
-                        json_t* versionJson = json_object_get(obj, "version");
-                        json_t* updatedAtJson = json_object_get(obj, "updated_at");
-                        if(json_is_integer(subIdJson) && json_is_string(versionJson) && json_is_string(updatedAtJson)) {
-                            u32 subId = (u32) json_integer_value(subIdJson);
-                            const char* version = json_string_value(versionJson);
-                            const char* updatedAt = json_string_value(updatedAtJson);
-
-                            u32 major = 0;
-                            u32 minor = 0;
-                            u32 micro = 0;
-                            sscanf(version, "%lu.%lu.%lu", &major, &minor, &micro);
-
-                            if(major > latestMajor
-                               || (major == latestMajor && minor > latestMinor)
-                               || (major == latestMajor && minor == latestMinor && micro > latestMicro)) {
-                                updateData->data.id = subId;
-                                string_copy(updateData->data.mtime, updatedAt, sizeof(updateData->data.mtime));
-                                string_copy(updateData->data.version, version, sizeof(updateData->data.version));
-
-                                latestMajor = major;
-                                latestMinor = minor;
-                                latestMicro = micro;
+                            for(u32 i = 0; i < json->u.object.length; i++) {
+                                json_value* val = json->u.object.values[i].value;
+                                if(strncmp(json->u.object.values[i].name, "name", json->u.object.values[i].name_length) == 0 && val->type == json_string) {
+                                    name = val;
+                                } else if(strncmp(json->u.object.values[i].name, "assets", json->u.object.values[i].name_length) == 0 && val->type == json_array) {
+                                    assets = val;
+                                }
                             }
+
+                            if(name != NULL && assets != NULL) {
+                                char versionString[16];
+                                snprintf(versionString, sizeof(versionString), "%d.%d.%d", VERSION_MAJOR, VERSION_MINOR, VERSION_MICRO);
+
+                                if(strncmp(name->u.string.ptr, versionString, name->u.string.length) != 0) {
+                                    char* url = NULL;
+
+                                    for(u32 i = 0; i < assets->u.array.length; i++) {
+                                        json_value* val = assets->u.array.values[i];
+                                        if(val->type == json_object) {
+                                            json_value* assetName = NULL;
+                                            json_value* assetUrl = NULL;
+
+                                            for(u32 j = 0; j < val->u.object.length; j++) {
+                                                json_value* subVal = val->u.object.values[j].value;
+                                                if(strncmp(val->u.object.values[j].name, "name", val->u.object.values[j].name_length) == 0 && subVal->type == json_string) {
+                                                    assetName = subVal;
+                                                } else if(strncmp(val->u.object.values[j].name, "browser_download_url", val->u.object.values[j].name_length) == 0 && subVal->type == json_string) {
+                                                    assetUrl = subVal;
+                                                }
+                                            }
+
+                                            if(assetName != NULL && assetUrl != NULL) {
+                                                if(strncmp(assetName->u.string.ptr, util_get_3dsx_path() != NULL ? "FBI.3dsx" : "FBI.cia", assetName->u.string.length) == 0) {
+                                                    url = assetUrl->u.string.ptr;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if(url != NULL) {
+                                        strncpy(updateData->url, url, URL_MAX);
+                                        hasUpdate = true;
+                                    } else {
+                                        res = R_FBI_BAD_DATA;
+                                    }
+                                }
+                            } else {
+                                res = R_FBI_BAD_DATA;
+                            }
+                        } else {
+                            res = R_FBI_BAD_DATA;
                         }
+                    } else {
+                        res = R_FBI_PARSE_FAILED;
                     }
                 }
 
-                if(latestMajor > VERSION_MAJOR
-                   || (latestMajor == VERSION_MAJOR && latestMinor > VERSION_MINOR)
-                   || (latestMajor == VERSION_MAJOR && latestMinor == VERSION_MINOR && latestMicro > VERSION_MICRO)) {
-                    snprintf(updateURL, DOWNLOAD_URL_MAX, "http://3ds.titledb.ga:7080/v1/%s/%lu/download", type, updateData->data.id);
-                    hasUpdate = true;
-                }
+                free(jsonText);
+            } else {
+                res = R_FBI_OUT_OF_MEMORY;
             }
-        } else {
-            res = R_APP_BAD_DATA;
         }
 
-        json_decref(json);
+        Result closeRes = util_http_close(&context);
+        if(R_SUCCEEDED(res)) {
+            res = closeRes;
+        }
     }
 
     ui_pop();
     info_destroy(view);
 
     if(hasUpdate) {
-        action_install_url("Vuoi aggiornare FBI all'ultima versione?", updateURL, fs_get_3dsx_path(), updateData, update_finished_url, update_finished_all, NULL);
+        if(R_SUCCEEDED(res = task_data_op(&updateData->installInfo))) {
+            info_display("Updating FBI", "Premi B per annullare.", true, data, update_install_update, NULL);
+        } else {
+            error_display_res(NULL, NULL, res, "Non è stato possibile aggiornare.");
+        }
     } else {
         if(R_FAILED(res)) {
-            error_display_res(NULL, NULL, res, "Non è stato possibile controllare gli aggiornamenti.");
+            if(res == R_FBI_HTTP_RESPONSE_CODE) {
+                error_display(NULL, NULL, "Non è stato possibile controllare gli aggiornamenti.\nIl server HTTP ha ritornato il codice %d", responseCode);
+            } else {
+                error_display_res(NULL, NULL, res, "Non è stato possibile controllare gli aggiornamenti.");
+            }
         } else {
-            prompt_display_notify("Successo", "Nessun aggiornamento disponibile.", COLOR_TEXT, NULL, NULL, NULL);
+            prompt_display("Completato", "Nessun aggiornamento disponibile.", COLOR_TEXT, false, NULL, NULL, NULL);
         }
 
-        free(updateData);
+        free(data);
+    }
+}
+
+static void update_onresponse(ui_view* view, void* data, bool response) {
+    if(response) {
+        info_display("Checking For Updates", "", false, data, update_check_update, NULL);
+    } else {
+        free(data);
     }
 }
 
 void update_open() {
     update_data* data = (update_data*) calloc(1, sizeof(update_data));
     if(data == NULL) {
-        error_display(NULL, NULL, "Failed to allocate update data.");
+        error_display(NULL, NULL, "Failed to allocate update check data.");
 
         return;
     }
 
-    info_display("Checking For Updates", "", false, data, update_check_update, NULL);
+    data->responseCode = 0;
+
+    data->installInfo.data = data;
+
+    data->installInfo.op = DATAOP_COPY;
+
+    data->installInfo.copyBufferSize = 128 * 1024;
+    data->installInfo.copyEmpty = false;
+
+    data->installInfo.total = 1;
+
+    data->installInfo.isSrcDirectory = update_is_src_directory;
+    data->installInfo.makeDstDirectory = update_make_dst_directory;
+
+    data->installInfo.openSrc = update_open_src;
+    data->installInfo.closeSrc = update_close_src;
+    data->installInfo.getSrcSize = update_get_src_size;
+    data->installInfo.readSrc = update_read_src;
+
+    data->installInfo.openDst = update_open_dst;
+    data->installInfo.closeDst = update_close_dst;
+    data->installInfo.writeDst = update_write_dst;
+
+    data->installInfo.suspendCopy = update_suspend_copy;
+    data->installInfo.restoreCopy = update_restore_copy;
+
+    data->installInfo.suspend = update_suspend;
+    data->installInfo.restore = update_restore;
+
+    data->installInfo.error = update_error;
+
+    data->installInfo.finished = true;
+
+    prompt_display("Confirmation", "Check for FBI updates?", COLOR_TEXT, true, data, NULL, update_onresponse);
 }
