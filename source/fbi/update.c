@@ -5,7 +5,7 @@
 #include <3ds.h>
 
 #include "section.h"
-#include "task/task.h"
+#include "../core/task/task.h"
 #include "../error.h"
 #include "../info.h"
 #include "../prompt.h"

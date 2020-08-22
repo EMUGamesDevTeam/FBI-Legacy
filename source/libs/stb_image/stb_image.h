@@ -1935,3 +1935,5 @@ stbi_inline static int stbi__jpeg_get_bit(stbi__jpeg *j)
 
 // given a value that's at position X in the zigzag stream,
 // where does it appear in the 8x8
+#endif
+#endif
