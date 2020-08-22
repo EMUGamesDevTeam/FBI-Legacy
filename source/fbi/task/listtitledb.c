@@ -5,14 +5,14 @@
 
 #include <3ds.h>
 
-#include "task.h"
-#include "../../list.h"
-#include "../../error.h"
-#include "../../../core/linkedlist.h"
-#include "../../../core/screen.h"
-#include "../../../core/util.h"
-#include "../../../json/json.h"
-#include "../../../stb_image/stb_image.h"
+#include "../../core/task/task.h"
+#include "../../core/ui/list.h"
+#include "../../core/error.h"
+#include "../../core/linkedlist.h"
+#include "../../core/screen.h"
+#include "listtitledb.h"
+#include "../../core/json.h"
+#include "../../libs/stb_image/stb_image.h"
 
 static Result task_populate_titledb_download(u32* downloadSize, void* buffer, u32 maxSize, const char* url) {
     Result res = 0;
